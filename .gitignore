@@ -1,0 +1,15 @@
+# Never publish source papers or personal documents
+*.md
+*.pdf
+*.docx
+Must Study Links.txt
+
+# Python environment and caches
+venv/
+__pycache__/
+*.pyc
+
+# OS and editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
