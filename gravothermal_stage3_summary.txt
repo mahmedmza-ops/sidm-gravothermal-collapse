@@ -1,0 +1,6 @@
+STAGE 3 - evolution complete
+  steps taken: 200000
+  final central density: 0.00  (started at 1.00)
+  contraction factor: 0.0
+  snapshots captured: 5
+  Saved gravothermal_stage3.png
