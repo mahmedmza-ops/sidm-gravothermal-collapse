@@ -11,8 +11,9 @@ STAGE 2: hydrostatic equilibrium. [done; method replaced]
          record: it is first order, its v^2 is 7.6-10% too high at N = 200, and its enclosed
          mass leaves out the sphere inside r = 0.01 and overcounts by about half a cell.
 STAGE 3: BSI (2002) "conduction-then-relaxation" in Lagrangian mass shells.
-         [SCAFFOLDING ONLY: shells, boundary conditions and the conduction step are
-         built; the relaxation step is a stub and no evolution is run.]
+         [Shells, boundary conditions, conduction step and relaxation step are built.
+         The relaxation step is UNDER TEST (test_relaxation.py; test 3 is the gate for
+         any evolution). No evolution is run.]
          The previous non-working Stage 3 (Newton/LM) is kept in git commit f0e90af;
          its three defects are shown in diagnose_stage3.py.
 Long-mean-free-path conduction only; a simplified reproduction of the self-similar regime.
@@ -81,12 +82,18 @@ def pressure_from_hse(r_edge, dm, P_ext):
     return P
 
 
-def hydrostatic_residual(r_edge, dm, P, P_ext):
-    """Residual of the discrete hydrostatic equations at edges 1..N, relative to the gravity term."""
+def gravity_terms(r_edge, dm):
+    """g_j = G M_j dmbar_j / (4 pi r_j^4) at edges 1..N; dmbar_j = (dm[j-1]+dm[j])/2, and dm[N-1]/2 at the edge."""
     M_e = np.concatenate(([0.0], np.cumsum(dm)))
     grav = np.empty(len(dm))
     grav[:-1] = G * M_e[1:-1] * 0.5 * (dm[:-1] + dm[1:]) / (4.0 * np.pi * r_edge[1:-1]**4)
     grav[-1] = G * M_e[-1] * 0.5 * dm[-1] / (4.0 * np.pi * r_edge[-1]**4)
+    return grav
+
+
+def hydrostatic_residual(r_edge, dm, P, P_ext):
+    """Residual of the discrete hydrostatic equations at edges 1..N, relative to the gravity term."""
+    grav = gravity_terms(r_edge, dm)
     dP = np.empty(len(dm))
     dP[:-1] = P[:-1] - P[1:]
     dP[-1] = P[-1] - P_ext
@@ -259,26 +266,154 @@ def conduction_step(r_edge, dm, v2_s, dt):
     return thomas_solve(off, diag, off, cap * v2_s)
 
 
-def relax_to_hydrostatic(r_edge, dm, s, P_ext):
-    """STUB -- NOT IMPLEMENTED. Adiabatic return to hydrostatic equilibrium (BSI 2002, sec. 4:
-    "hydrostatic equilibrium is solved by keeping the entropy of each Lagrangian zone fixed,
-    while its position and other thermodynamic properties are modified").
+def discrete_energy(r_edge, dm, v2_s, P_ext):
+    """Return (U, W, P_ext V): thermal, gravitational and boundary-work energy of the shells.
 
-    This is where the PdV heating -- the negative heat capacity of virial_theorem.py -- lives.
-    Plan for the formulation check:
-      held fixed : shell masses dm_i and shell entropies s_i = v_i^3 / rho_i
-      unknowns   : edge radii r_1..r_N (r_0 = 0 at the centre stays fixed)
-      per shell  : rho_i = dm_i / ((4 pi/3)(r_{i+1}^3 - r_i^3))
-                   v2_i  = (s_i rho_i)^(2/3)       <- v^2 ∝ rho^(2/3): compression heats
-                   p_i   = rho_i v2_i = s_i^(2/3) rho_i^(5/3)   (gamma = 5/3, monatomic)
-      equations  : hydrostatic_residual(...) = 0 at edges 1..N, outer edge against P_ext.
-      Edge j's equation involves p_{j-1} (depends on r_{j-1}, r_j), p_j (r_j, r_{j+1}) and r_j,
-      so linearising in the edge displacements gives the tridiagonal system
-          a_j dr_{j-1} + b_j dr_j + c_j dr_{j+1} = d_j     (d_j = -residual_j),
-      solved with thomas_solve and iterated (Newton) until the residual is small.
-      Returns new r_edge and v2; the caller recomputes s only after conduction steps.
+    U = sum (3/2) dm v^2;  W = -sum_j G M_j dmbar_j / r_j (edges 1..N, same dmbar as gravity_terms);
+    P_ext V = P_ext (4 pi/3) r_N^3. At fixed shell entropies, d(U + W + P_ext V)/dr_j = -4 pi r_j^2 F_j,
+    with F_j the hydrostatic residual of relaxation_system. So the discrete hydrostatic equations
+    are exactly the stationarity conditions of this discrete energy, and this W is the
+    gravitational energy consistent with them (it is a quadrature of -G m dm / r).
     """
-    raise NotImplementedError("Stage 3 relaxation step not built yet (awaiting formulation check).")
+    gtil = gravity_terms(r_edge, dm) * 4.0 * np.pi * r_edge[1:]**4      # G M_j dmbar_j
+    U = np.sum(1.5 * dm * v2_s)
+    W = -np.sum(gtil / r_edge[1:])
+    return U, W, P_ext * 4.0 / 3.0 * np.pi * r_edge[-1]**3
+
+
+def relaxation_system(r_edge, dm, s, P_ext):
+    """State at fixed shell entropies, its hydrostatic residual F, and the tridiagonal Jacobian.
+
+    Per shell: rho_i = dm_i / V_i,  v2_i = (s_i rho_i)^(2/3),  p_i = rho_i v2_i = s_i^(2/3) rho_i^(5/3).
+    Residual at edge j:  F_j = p_{j-1} - p_j - g_j  (j < N),   F_N = p_{N-1} - P_ext - g_N.
+    With W_i = r_{i+1}^3 - r_i^3:
+      dp_i/dr_{i+1} = -5 p_i r_{i+1}^2 / W_i,  dp_i/dr_i = +5 p_i r_i^2 / W_i,  dg_j/dr_j = -4 g_j / r_j
+    so  a_j = +5 p_{j-1} r_{j-1}^2 / W_{j-1}
+        b_j = -5 p_{j-1} r_j^2 / W_{j-1} - 5 p_j r_j^2 / W_j + 4 g_j / r_j   (no p_j term at j = N)
+        c_j = +5 p_j r_{j+1}^2 / W_j                                       (c_N = 0)
+    Unknowns dr_1..dr_N (dr_0 = 0). Arrays follow thomas_solve's layout, unscaled.
+    """
+    rho_r = shell_density(r_edge, dm)
+    v2_r = (s * rho_r)**(2.0 / 3.0)
+    p_r = rho_r * v2_r
+    g = gravity_terms(r_edge, dm)
+    W = r_edge[1:]**3 - r_edge[:-1]**3
+    F = np.empty(len(dm))
+    F[:-1] = p_r[:-1] - p_r[1:] - g[:-1]
+    F[-1] = p_r[-1] - P_ext - g[-1]
+    inner = 5.0 * p_r[1:] * r_edge[1:-1]**2 / W[1:]          # 5 p_j r_j^2 / W_j, j = 1..N-1
+    diag = -5.0 * p_r * r_edge[1:]**2 / W + 4.0 * g / r_edge[1:]
+    diag[:-1] -= inner
+    lower = inner.copy()
+    upper = 5.0 * p_r[1:] * r_edge[2:]**2 / W[1:]
+    return {"rho": rho_r, "v2": v2_r, "p": p_r, "g": g, "F": F,
+            "lower": lower, "diag": diag, "upper": upper}
+
+
+def relax_to_hydrostatic(r_edge, dm, s, P_ext, tol=1e-10, step_tol=1e-13, max_iter=50, dense_check=True):
+    """Adiabatic return to hydrostatic equilibrium (BSI 2002, sec. 4: "hydrostatic equilibrium is
+    solved by keeping the entropy of each Lagrangian zone fixed, while its position and other
+    thermodynamic properties are modified"). Formulation approved by the advisor before coding.
+
+    Held fixed : shell masses dm_i (so the edge masses M_j) and shell entropies s_i = v_i^3 / rho_i;
+                 r_0 = 0; P_ext. Entropies change only in the conduction step, never here.
+    Unknowns   : edge radii r_1..r_N.
+    Compression law: S = c_v ln(T^(3/2)/rho) + const with k_B T = m v^2, so at fixed s
+                 v^2 = (s rho)^(2/3) ∝ rho^(2/3) and p ∝ rho^(5/3) (gamma = 5/3). It is the first
+                 law with no heat flow: d ln v^2 = (2/3) d ln rho. Compressing a shell heats it:
+                 this is the PdV work, and the shell-level form of virial_theorem.py's E = -K.
+    Equations  : the discrete form of dp/dm = -G m/(4 pi r^4) (identical to d(rho v^2)/dr =
+                 -G M rho / r^2, with M fixed per edge), linearised into the tridiagonal system
+                 a_j dr_{j-1} + b_j dr_j + c_j dr_{j+1} = -F_j  (see relaxation_system), rows
+                 scaled by g_j.
+    Iteration  : Newton loop of Thomas solves. Converged when max|F_j/g_j| <= max(tol, floor) AND
+                 the next Newton step has max|dr/r| <= step_tol (advisor ruling, option 1). "floor"
+                 is the double-precision floor of |F/g| computed from the current state (W_i
+                 cancellation, p ∝ W^(-5/3)): test 2 showed 1e-10 alone is below it (~1.35e-9), so
+                 the criterion never asks for digits the machine does not have, and adds no tuned
+                 constant. step_tol = 1e-13 lies between round-off steps (~1.5e-16) and physical
+                 displacements (~1e-4). If a step would make any edge non-monotonic, or would not
+                 reduce ||F/g||, it is halved; this changes the path, not the solution. Failure to
+                 converge in max_iter raises RuntimeError with the iteration history: the state is
+                 never accepted unconverged. Every solve returns its residual, floor and history.
+    Conditioning: the +4g/r gravity term reduces |b_j|, so diagonal dominance (which Thomas
+                 without pivoting relies on) is not guaranteed. With dense_check, every Thomas
+                 solve is compared with numpy.linalg.solve and the worst relative difference is
+                 reported, with the smallest |b_j| / (|a_j| + |c_j|).
+    Sign of the feedback, stated precisely (point 5 of the formulation): a shell that lost heat
+                 has lower s, so lower p; relaxation compresses it and its v^2 RISES during this
+                 step. That is guaranteed by gamma = 5/3. It does NOT guarantee that the shell ends
+                 hotter than before it lost heat: alone, it does not. Net heating -- negative heat
+                 capacity -- needs the whole core to contract, so that gravity (∝ M/r^4) raises
+                 the required pressure faster than the density (v^2 ~ G M_c / r_c). That is an
+                 outcome to be demonstrated (test_relaxation.py, test 3), not an assumption.
+    Returns (r_edge_new, rho, v2, info).
+    """
+    def roundoff_floor(r_e, sm):
+        # Estimated floor of |F_j/g_j| from double precision: W_i = r_{i+1}^3 - r_i^3 loses
+        # (r_{i+1}^3 + r_i^3)/W_i of relative precision, and p ∝ W^(-5/3). Reporting only.
+        Wv = r_e[1:]**3 - r_e[:-1]**3
+        dp = (5.0 / 3.0) * np.finfo(float).eps * (r_e[1:]**3 + r_e[:-1]**3) / Wv * sm["p"]
+        fl = np.empty(len(dp))
+        fl[:-1] = dp[:-1] + dp[1:]
+        fl[-1] = dp[-1]
+        return np.max(fl / sm["g"])
+
+    r_cur = r_edge.copy()
+    info = {"iterations": 0, "halvings": 0, "thomas_vs_dense": float("nan"),
+            "min_diag_dominance": float("nan"), "history": []}
+    sysm = relaxation_system(r_cur, dm, s, P_ext)
+    err = np.max(np.abs(sysm["F"] / sysm["g"]))
+    converged = False
+    for it in range(max_iter):
+        g = sysm["g"]
+        lo, di, up = sysm["lower"] / g[1:], sysm["diag"] / g, sysm["upper"] / g[:-1]
+        rhs = -sysm["F"] / g
+        dx = thomas_solve(lo, di, up, rhs)
+        worst = int(np.argmax(np.abs(sysm["F"] / g)))
+        step = np.max(np.abs(dx) / r_cur[1:])
+        floor = roundoff_floor(r_cur, sysm)
+        info["history"].append((it, err, r_cur[worst + 1], step, floor))
+        if err <= max(tol, floor) and step <= step_tol:
+            converged = True
+            info["residual"], info["roundoff_floor"] = err, floor
+            break
+        dom = np.abs(di) / (np.concatenate(([0.0], np.abs(lo))) + np.concatenate((np.abs(up), [0.0])))
+        info["min_diag_dominance"] = np.nanmin([info["min_diag_dominance"], dom.min()])
+        if dense_check:
+            A = np.diag(di) + np.diag(lo, -1) + np.diag(up, 1)
+            dx_dense = np.linalg.solve(A, rhs)
+            diff = np.max(np.abs(dx - dx_dense)) / np.max(np.abs(dx_dense))
+            info["thomas_vs_dense"] = np.nanmax([info["thomas_vs_dense"], diff])
+        norm0 = np.linalg.norm(sysm["F"] / g)
+        lam = 1.0
+        while True:
+            r_try = r_cur.copy()
+            r_try[1:] += lam * dx
+            if np.all(np.diff(r_try) > 0.0):
+                sys_try = relaxation_system(r_try, dm, s, P_ext)
+                if np.linalg.norm(sys_try["F"] / sys_try["g"]) < norm0:
+                    break
+            lam *= 0.5
+            info["halvings"] += 1
+            if lam < 1e-8:
+                raise RuntimeError(f"relaxation: no acceptable Newton step at iteration {it}, "
+                                   f"max relative residual {err:.3e}\n" + history_text(info))
+        r_cur, sysm = r_try, sys_try
+        err = np.max(np.abs(sysm["F"] / sysm["g"]))
+        info["iterations"] = it + 1
+    if not converged:
+        raise RuntimeError(f"relaxation did not converge in {max_iter} iterations: "
+                           f"max relative residual {err:.3e}\n" + history_text(info))
+    return r_cur, sysm["rho"], sysm["v2"], info
+
+
+def history_text(info):
+    """Per-iteration record of a relaxation solve, for error reports."""
+    lines = ["  iter   max|F/g|   at edge r    max|dr/r|   est. round-off floor of |F/g|"]
+    for it, e, rw, dxr, fl in info["history"]:
+        lines.append(f"  {it:4d}  {e:10.3e}  {rw:10.4e}  {dxr:10.3e}  {fl:10.3e}")
+    return "\n".join(lines)
 
 
 # ---------- setup checks (no time evolution is run) ----------
@@ -310,4 +445,4 @@ v2_one = conduction_step(r_edge, dm, v2_s, dt=1.0)
 E_th1 = np.sum(1.5 * dm * v2_one)
 print(f"  one conduction step (dt = 1): thermal energy change {abs(E_th1 - E_th0) / E_th0:.3e} (relative),"
       f" max |dv2| = {np.abs(v2_one - v2_s).max():.4e}")
-print("  relaxation step: STUB (relax_to_hydrostatic raises NotImplementedError)")
+print("  relaxation step: implemented, UNDER TEST (test_relaxation.py; test 3 gates any evolution)")
