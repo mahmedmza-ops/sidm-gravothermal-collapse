@@ -3,6 +3,7 @@
 *.pdf
 *.docx
 Must Study Links.txt
+Claude Code Responses.txt
 
 # Python environment and caches
 venv/

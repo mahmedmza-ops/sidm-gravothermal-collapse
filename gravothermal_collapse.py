@@ -3,295 +3,311 @@ Gravothermal Collapse of a Self-Interacting Dark Matter Halo
 Reproduction of Balberg, Shapiro & Inagaki (2002), cited in my BSc dissertation.
 
 STAGE 1: radial grid and initial density (r^-2.19). [done]
-STAGE 2: hydrostatic equilibrium imposed (mean residual ~0.05). [done]
-STAGE 3: let heat conduct core -> halo and evolve in time. The core should
-         contract and heat (negative heat capacity), reproducing the
-         core-contraction of the paper's Figure 2. Long-mean-free-path
-         conduction only; a simplified reproduction of the self-similar regime.
+STAGE 2: hydrostatic equilibrium. [done; method replaced]
+         Canonical: Lagrangian-shell construction with exact shell masses and the envelope
+         pressure P_ext at the outer edge. Second order; v^2 within 1.1e-3 of the continuum
+         solution at N = 200 (diagnose_stage2_resolution.py).
+         The original Stage 2 integration (mean residual ~0.05) is kept below as a superseded
+         record: it is first order, its v^2 is 7.6-10% too high at N = 200, and its enclosed
+         mass leaves out the sphere inside r = 0.01 and overcounts by about half a cell.
+STAGE 3: BSI (2002) "conduction-then-relaxation" in Lagrangian mass shells.
+         [SCAFFOLDING ONLY: shells, boundary conditions and the conduction step are
+         built; the relaxation step is a stub and no evolution is run.]
+         The previous non-working Stage 3 (Newton/LM) is kept in git commit f0e90af;
+         its three defects are shown in diagnose_stage3.py.
+Long-mean-free-path conduction only; a simplified reproduction of the self-similar regime.
 """
 
 import numpy as np
-import matplotlib.pyplot as plt
-from pathlib import Path
-from scipy.optimize import root
+from scipy.integrate import quad
 
 G = 1.0
 
-# ---------- grid and initial profile (Stages 1-2) ----------
+# ---------- Stage 1: grid and initial density profile ----------
 N = 200
 r = np.logspace(-2, 2, N)
 alpha = 2.19
-rho = 1.0 / (1.0 + r**alpha)
-dr = np.gradient(r)
-M = np.cumsum(4 * np.pi * r**2 * rho * dr)
 
-# equilibrium temperature (velocity dispersion squared), from Stage 2
-gravity_term = G * M * rho / r**2
-p = np.zeros_like(r)
+
+def rho_stage1(x):
+    """The Stage 1 density profile, as a function of radius."""
+    return 1.0 / (1.0 + x**alpha)
+
+
+rho = rho_stage1(r)
+
+
+# ---------- shell geometry and hydrostatics (used by Stages 2 and 3) ----------
+def shell_density(r_edge, dm):
+    """Mean density of each shell: fixed mass over current volume."""
+    return dm / (4.0 / 3.0 * np.pi * (r_edge[1:]**3 - r_edge[:-1]**3))
+
+
+def shell_centres(r_edge):
+    """Radius that splits each shell's volume in half; used for gradients between shells."""
+    return (0.5 * (r_edge[:-1]**3 + r_edge[1:]**3))**(1.0 / 3.0)
+
+
+def envelope_pressure(r_out, M_out, r_far=1e10, n=20001):
+    """Pressure the halo beyond r_out exerts at r_out: integral of G M rho / r^2 to infinity.
+
+    The Stage 1 profile continues as rho ∝ r^-2.19 beyond the grid (BSI: the extended halo
+    keeps this power law and barely evolves). r_out is a computational edge, not the edge of
+    the halo, so the pressure there is the weight of the envelope outside it -- not zero.
+    Integrand falls as r^-3.38, so stopping at r_far = 1e10 is negligible.
+    """
+    rr = np.geomspace(r_out, r_far, n)
+    rho_t = rho_stage1(rr)
+    f = 4.0 * np.pi * rr**2 * rho_t
+    M_t = M_out + np.concatenate(([0.0], np.cumsum(0.5 * (f[1:] + f[:-1]) * np.diff(rr))))
+    return np.trapezoid(G * M_t * rho_t / rr**2, rr)
+
+
+def pressure_from_hse(r_edge, dm, P_ext):
+    """Shell pressures in exact discrete hydrostatic equilibrium, integrated inward from P_ext.
+
+    Discretisation of dp/dm = -G m / (4 pi r^4), evaluated at the edges:
+      interior edge j (between shells j-1 and j): p[j-1] - p[j] = G M_j (dm[j-1]+dm[j])/2 / (4 pi r_j^4)
+      outer edge N:                               p[N-1] - P_ext = G M_N (dm[N-1]/2)     / (4 pi r_N^4)
+    hydrostatic_residual() uses the same formulas, so this state is its exact fixed point
+    (the property the old reconstruction lacked: defect 2).
+    """
+    M_e = np.concatenate(([0.0], np.cumsum(dm)))
+    n = len(dm)
+    P = np.empty(n)
+    P[-1] = P_ext + G * M_e[-1] * (0.5 * dm[-1]) / (4.0 * np.pi * r_edge[-1]**4)
+    for j in range(n - 1, 0, -1):
+        P[j - 1] = P[j] + G * M_e[j] * 0.5 * (dm[j - 1] + dm[j]) / (4.0 * np.pi * r_edge[j]**4)
+    return P
+
+
+def hydrostatic_residual(r_edge, dm, P, P_ext):
+    """Residual of the discrete hydrostatic equations at edges 1..N, relative to the gravity term."""
+    M_e = np.concatenate(([0.0], np.cumsum(dm)))
+    grav = np.empty(len(dm))
+    grav[:-1] = G * M_e[1:-1] * 0.5 * (dm[:-1] + dm[1:]) / (4.0 * np.pi * r_edge[1:-1]**4)
+    grav[-1] = G * M_e[-1] * 0.5 * dm[-1] / (4.0 * np.pi * r_edge[-1]**4)
+    dP = np.empty(len(dm))
+    dP[:-1] = P[:-1] - P[1:]
+    dP[-1] = P[-1] - P_ext
+    return (dP - grav) / grav
+
+
+# ---------- Stage 2 (canonical): hydrostatic equilibrium on Lagrangian shells ----------
+# Shell edges are the Stage 1 grid points plus the centre, so shell 0 is the sphere inside
+# r[0]. Each shell's mass is the exact integral of the Stage 1 density over it (this is the
+# corrected enclosed mass: it includes the inner sphere and has no half-cell overcount), and
+# is then fixed for all time. M_edge[k] is the exact mass inside r_edge[k].
+r_edge = np.concatenate(([0.0], r))
+n_shell = len(r_edge) - 1
+dm = np.array([quad(lambda x: 4.0 * np.pi * x**2 * rho_stage1(x), r_edge[i], r_edge[i + 1])[0]
+               for i in range(n_shell)])
+M_edge = np.concatenate(([0.0], np.cumsum(dm)))
+
+# --- boundary conditions ---
+# Inner (r = 0): r_0 = 0, M_0 = 0 and L_0 = 0 by spherical symmetry; edge 0 never moves.
+# Outer (r_N = 100): the pressure is held at P_ext, the weight of the r^-2.19 envelope beyond
+#   the grid (envelope_pressure). This replaces the original Stage 2's p = 0 edge, which forced
+#   v^2 = 0 in the last cell and created the 3e7 temperature cliff (defect 1). P_ext is computed
+#   once from the Stage 1 profile -- no free constant -- and held fixed because BSI's extended
+#   halo barely evolves. The outer radius may move during relaxation.
+#   Thermally the outer edge is insulating, L_N = 0: an isolated halo, as in BSI. Heat that
+#   reaches the last shell stays there; with r_N = 100 core radii this is a stated
+#   approximation, to be checked once evolution runs.
+P_ext = envelope_pressure(r_edge[-1], M_edge[-1])
+
+# --- initial thermal state ---
+# Integrate hydrostatic equilibrium inward from P_ext, then v^2 = p / rho, using the
+# discretisation the relaxation step will enforce.
+#
+# Temperature inversion -- a property of this cored halo, not a numerical artefact. The
+# exact continuum solution for rho = 1/(1 + r^2.19) has v^2 = 2.69 at the centre rising to
+# 3.61 near r = 10 (diagnose_stage2_resolution.py), because v^2 = p/rho rises wherever the
+# density steepens faster than the pressure falls: d ln v^2/d ln r = d ln p/d ln r - d ln rho/d ln r.
+# Starting from this cored halo, the evolution therefore has an initial phase in which heat
+# flows INWARD and the core mildly expands, before any gravothermal runaway. That early phase
+# is physical for this start and must not be read as the collapse, or as the old bug; the
+# setup checks below count the inward-conducting edges so it stays visible. (BSI start from
+# their self-similar profile instead; its ODEs are not available to us in a verifiable form,
+# so we do not reconstruct it.)
+rho_s = shell_density(r_edge, dm)
+P_s = pressure_from_hse(r_edge, dm, P_ext)
+v2_s = P_s / rho_s
+s_s = v2_s**1.5 / rho_s
+
+# ---------- Stage 2 (original, SUPERSEDED): kept verbatim as a record, not used ----------
+# This was the first Stage 2 and carried a "verified" label on its mean residual of ~0.05.
+# Measured against the continuum solution (diagnose_stage2_resolution.py):
+#   - its v^2 is 7.6% (centre) to 10.2% (r = 10-50) too high at N = 200, a first-order error
+#     that halves when N doubles: the enclosed mass is overcounted by about half a cell
+#     (+5.5% at r = 1), and the pressure is integrated with gravity from the inner end of each
+#     interval;
+#   - its enclosed mass leaves out the sphere inside r = 0.01 (M is 80% low at r = 0.01, and
+#     the error grows with N) -- the "rough inner-boundary shell" noted in commit 935c3f9;
+#   - p = 0 at r = 100 gives v^2 = 0 in the last cell (defect 1 of the old Stage 3).
+# The "verified" label applies to the canonical shell construction above, not to this.
+dr_s2 = np.gradient(r)
+M_s2 = np.cumsum(4 * np.pi * r**2 * rho * dr_s2)
+gravity_term_s2 = G * M_s2 * rho / r**2
+p_s2 = np.zeros_like(r)
 for i in range(N - 2, -1, -1):
-    p[i] = p[i+1] + gravity_term[i] * (r[i+1] - r[i])
-v2 = p / rho
+    p_s2[i] = p_s2[i+1] + gravity_term_s2[i] * (r[i+1] - r[i])
+v2_s2 = p_s2 / rho
 
-# ---------- Stage 3: coupled hydrostatic + conductive energy update ----------
-# STATUS: NON-WORKING AND SUPERSEDED. Kept only so the history is truthful.
-# Three defects were diagnosed and shown numerically in diagnose_stage3.py:
-#   1. Boundary cliff: Stage 2 gives v2[-1] = 0 (p[-1] = 0); clamped to 1e-8 it sits 3e7 below
-#      v2[-2], anchors P[-1] ~ rho*1e-8, and the global mass rescale then puts ~100% of the
-#      mass in the outermost interval (one call: rho_c falls to ~1e-6 of its start).
-#   2. Fixed-point error: the pressure reconstruction uses exp(x) or (1+x) where Stage 2 has
-#      1/(1-x), so even with a clean anchor one call changes rho_c by a factor 0.39 / 0.20.
-#   3. No PdV work term: pure conduction conserves sum(w*v2) and never raises max(v2); it
-#      relaxes toward uniform. It can warm the centre transiently (the Stage-2 profile peaks
-#      off-centre), but it cannot give the unbounded central heating of gravothermal runaway.
-#      That needs compression heating, i.e. the negative heat capacity of simulation 3.
-# The comments below, which call this scheme "the correct approach" or what the literature
-# uses, were written before the diagnosis and are not supported by the results. Also known:
-# the dt-halving loop has no floor, and the plot/summary block is duplicated at the end.
-# The previous Stage-3 implementation solved conduction and hydrostatic balance in
-# sequence. That split is unphysical because the thermal support changes first and the
-# density is then adjusted afterward, which inverts the gravothermal feedback: the core
-# cools and its density collapses instead of contracting under the coupling of heat
-# transport and hydrostatic support. The correct approach in the quasi-static SIDM
-# gravothermal limit is to solve the coupled energy equation and hydrostatic equation
-# simultaneously at the new time level.
+# ---------- Stage 3: gravothermal evolution in Lagrangian mass shells ----------
+# This is the dissertation's conclusion made to run, driven by the same engine as
+# virial_theorem.py (simulation 3). There, a virialised sphere has E = -K, so when it
+# loses energy it contracts and its temperature RISES: negative heat capacity. Here the
+# same mechanism is meant to act shell by shell inside a real halo, in two sub-steps:
+#   1. conduction: heat flows down the temperature gradient. At fixed shell volume a shell
+#      that loses heat has its v^2 fall -- ordinary, positive-heat-capacity loss. On its own
+#      this can only relax the profile toward uniform (diagnose_stage3.py, section E).
+#   2. relaxation: a shell that lost heat no longer has the pressure to carry the weight
+#      above it, so the shells move back into hydrostatic equilibrium. The move is
+#      adiabatic (each shell keeps its entropy), and compression at fixed entropy heats the
+#      shell: v^2 ∝ rho^(2/3). This PdV work is the term the earlier attempts lacked.
+# For a self-gravitating core the compression heating outweighs the conductive loss -- that
+# is what negative heat capacity means -- so the core ends each cycle denser and hotter,
+# conducts faster, and runs away: the gravothermal catastrophe of BSI (2002), the route to
+# a seed black hole argued in the dissertation. That outcome is the thing to be SHOWN once
+# the relaxation step exists; nothing here assumes or claims it.
 #
-# We therefore solve for the new velocity-dispersion profile v^2_{n+1} and the density
-# field rho_{n+1} by Newton iteration. The residual is built from the implicit energy
-# equation at backwards Euler time level and the hydrostatic balance at the same time
-# level; each trial v^2_{n+1} is converted into a hydrostatic density field before the
-# energy residual is evaluated. This is the coupled fully-implicit form that the
-# SIDM-GTF/gravothermal literature uses, rather than the sequential update-then-rebalance
-# scheme that produced the wrong sign of the core response.
-#
-# We keep the conduction-only, no-hyperbolic-flow limit exactly as requested: this is
-# not a finite-volume hydrodynamic solver, just the diffusion of thermal energy in a
-# quasi-static hydrostatic halo.
+# Equations (BSI 2002, eqs. 4-7; time derivatives Lagrangian), in mass coordinate m:
+#   dr/dm   = 1 / (4 pi r^2 rho)                       mass
+#   dp/dm   = -G m / (4 pi r^4),   p = rho v^2         hydrostatic equilibrium
+#   L       = -4 pi r^2 kappa dv^2/dr                  conduction (flux down the gradient)
+#   (3/2) Dv^2/Dt - (v^2/rho) Drho/Dt = -dL/dm         first law: heat flux + PdV work
+# The first law is split exactly along the two sub-steps: conduction carries -dL/dm at fixed
+# rho; relaxation carries the PdV term at fixed entropy s = v^3/rho (BSI's effective entropy).
+
+# --- physical inputs for conduction (long-mean-free-path limit) ---
+# lmfp flux, BSI eq. (12): F = L/(4 pi r^2) ∝ -rho (H^2 / t_r) dv^2/dr, with the gravitational
+# scale height H^2 = v^2 / (4 pi G rho) and the SIDM relaxation time t_r ∝ 1/(rho sigma v)
+# (paper text: "for SIDM t_r ∝ (rho v)^-1"). Hence kappa ∝ sigma rho v^3 / (4 pi G).
+# The paper's combined bracket [a sigma^2 + 4 pi G (rho v^2)^-1]^-1 (text below eq. 14)
+# reduces to rho v^2/(4 pi G) in this limit, consistent with the v^3 dependence.
+# The advisor's first brief wrote v to the first power; that was checked against the paper
+# text above and corrected to v^3 by the advisor's ruling.
+SIGMA_HAT = 1.0
+# Cross-section per unit mass in code units. In the pure lmfp limit it only sets the time
+# unit (t ∝ 1/sigma); times will be reported in units of the initial central t_r.
+C_LMFP_PLACEHOLDER = 1.0
+# NAMED PLACEHOLDER, NOT A FITTED VALUE: the overall numerical coefficient of BSI eq. (14)
+# (it involves b ≈ 1.002 and a = sqrt(16/pi)) is in the PDF's equation images, which this
+# session could not read; the advisor will supply it. In the lmfp limit it only rescales
+# time; it must be set before any time is compared with BSI's t_coll ≈ 290 t_r.
 
 
-def enclosed_mass(r, rho):
-    """Compute the enclosed-mass profile from a density field."""
-    dr = np.gradient(r)
-    shell_mass = 4.0 * np.pi * r**2 * rho * dr
-    return np.concatenate(([0.0], np.cumsum(shell_mass[1:])))
+def thomas_solve(lower, diag, upper, rhs):
+    """Solve a tridiagonal linear system with the Thomas algorithm (from commit 2ec9193)."""
+    n = len(diag)
+    c_prime = np.zeros_like(upper)
+    d_prime = np.zeros_like(rhs)
+    c_prime[0] = upper[0] / diag[0]
+    d_prime[0] = rhs[0] / diag[0]
+
+    for i in range(1, n):
+        denom = diag[i] - lower[i - 1] * c_prime[i - 1]
+        if i < n - 1:
+            c_prime[i] = upper[i] / denom
+        d_prime[i] = (rhs[i] - lower[i - 1] * d_prime[i - 1]) / denom
+
+    x = np.zeros_like(rhs)
+    x[-1] = d_prime[-1]
+    for i in range(n - 2, -1, -1):
+        x[i] = d_prime[i] - c_prime[i] * x[i + 1]
+    return x
 
 
-def hydrostatic_from_v2(r, rho_ref, v2_trial, M_total):
-    """Return rho consistent with hydrostatic equilibrium for a given v^2 profile."""
-    # For a trial new-time temperature profile, we integrate the hydrostatic pressure
-    # equation from the outside in: dP/dr = -G M(r) rho / r^2. Using P = rho v^2 and
-    # rho = P / v^2, the cell pressure is adjusted to satisfy the same hydrostatic
-    # support at the new time. This keeps the density response locked to the thermal
-    # support, which is the actual physical coupling that the sequential method missed.
-    P = np.empty_like(v2_trial)
-    M_env = enclosed_mass(r, rho_ref)
-    P[-1] = rho_ref[-1] * v2_trial[-1]
-    for i in range(len(r) - 2, -1, -1):
-        dr_i = r[i + 1] - r[i]
-        rho_guess = P[i + 1] / (v2_trial[i] + 1e-12)
-        dP_dr = G * M_env[i] * rho_guess / (r[i]**2 + 1e-12)
-        P[i] = P[i + 1] + dP_dr * dr_i
-    rho_new = np.clip(P / (v2_trial + 1e-12), 1e-12, 1e6)
-    mass = 4.0 * np.pi * np.trapezoid(r**2 * rho_new, r)
-    if mass > 0.0:
-        rho_new *= M_total / mass
-    return np.clip(rho_new, 1e-12, 1e6)
+def conductivity_lmfp(rho_s, v2_s):
+    """kappa in F = -kappa dv^2/dr, lmfp limit: C * sigma * rho * v^3 / (4 pi G). See notes above."""
+    return C_LMFP_PLACEHOLDER * SIGMA_HAT * rho_s * v2_s**1.5 / (4.0 * np.pi * G)
 
 
-def conduction_residual(r, rho, v2_new, v2_old, dt):
-    """Backward-Euler conduction residual at the new time level."""
-    # The energy equation is the conduction diffusion equation with a local heat
-    # capacity proportional to the thermal support: d(v^2)/dt = (1/r^2) d/dr[r^2 kappa
-    # d(v^2)/dr], with kappa ~ rho r^2 / sqrt(v^2). This is the conduction-only
-    # gravothermal limit in which the unstable negative heat-capacity response emerges
-    # from the coupled thermal and hydrostatic update rather than from an ad hoc density
-    # renormalisation.
-    eps = 1e-12
-    v2_safe = np.maximum(v2_new, eps)
-    kappa = 1.0e-2 * rho * r**2 / (np.sqrt(v2_safe) + eps)
-    grad_v2 = np.gradient(v2_new, r, edge_order=2)
-    flux = -kappa * grad_v2
-    div_flux = np.gradient(r**2 * flux, r, edge_order=2) / (r**2 + eps)
-    return (v2_new - v2_old) / dt - div_flux
+def edge_conductance(r_edge, dm, v2_s):
+    """C_j = 4 pi r_j^2 kappa_j / (rc_j - rc_{j-1}) at interior edges, so that L_j = -C_j (v2_j - v2_{j-1})."""
+    kappa = conductivity_lmfp(shell_density(r_edge, dm), v2_s)
+    rc = shell_centres(r_edge)
+    return 4.0 * np.pi * r_edge[1:-1]**2 * 0.5 * (kappa[:-1] + kappa[1:]) / (rc[1:] - rc[:-1])
 
 
-def coupled_implicit_step(r, rho, v2, dt, M_total, x0=None):
-    """Solve the coupled hydrostatic-energy system with a Newton-type root solve."""
-    # We use scipy.optimize.root here because the fully coupled residual is nonlinear
-    # in both the conductive flux and the hydrostatic density reconstruction. A full
-    # analytical Jacobian is possible in principle, but for a 80-point Stage-3 profile
-    # the finite-difference Jacobian is much simpler and robust. method='lm' is used
-    # here because the residual is stiff and the previous-step solution is a good warm
-    # start; the Levenberg-Marquardt step is more forgiving than 'hybr' on ill-scaled
-    # nonlinear systems while preserving the same implicit Newton-style correction.
-    x0 = np.asarray(v2 if x0 is None else x0, dtype=float)
-
-    def residual(x):
-        rho_h = hydrostatic_from_v2(r, rho, x, M_total)
-        return conduction_residual(r, rho_h, x, v2, dt)
-
-    sol = root(
-        residual,
-        x0,
-        method="lm",
-        options={"xtol": 1e-7, "ftol": 1e-7, "gtol": 1e-7, "maxfev": 5000},
-    )
-    if not sol.success:
-        return None, None, sol.message, np.max(np.abs(residual(sol.x))) if sol.x is not None else np.inf
-
-    x_new = np.maximum(sol.x, 1e-12)
-    rho_new = hydrostatic_from_v2(r, rho, x_new, M_total)
-    return x_new, rho_new, "ok", np.max(np.abs(residual(x_new)))
+def luminosity(r_edge, dm, v2_s):
+    """L at all N+1 edges. L = 0 at the centre (symmetry) and at the outer edge (isolated halo)."""
+    L = np.zeros(len(dm) + 1)
+    L[1:-1] = -edge_conductance(r_edge, dm, v2_s) * (v2_s[1:] - v2_s[:-1])
+    return L
 
 
-# Stage 3 time evolution: keep the verified Stages 1-2 on the original grid, but
-# evolve the gravothermal coupling on a smaller Stage-3 grid so the Newton solve runs
-# in plain Python without a prohibitively expensive dense Jacobian.
-rho0_initial = rho[0]
-M_total = 4.0 * np.pi * np.trapezoid(r**2 * rho, r)
+def conduction_step(r_edge, dm, v2_s, dt):
+    """Implicit conduction sub-step at fixed shell radii (so fixed rho): returns new v^2.
 
-# Reduced Stage-3 grid to keep the coupled Newton solve finite and stable.
-stage3_r = np.geomspace(r.min(), r.max(), 80)
-rho_stage3 = np.interp(stage3_r, r, rho)
-v2_stage3 = np.interp(stage3_r, r, v2)
+    Per shell, (3/2) dm_i (v2_i' - v2_i) / dt = L_i - L_{i+1}, i.e. (3/2) Dv^2/Dt = -dL/dm.
+    In the mass coordinate the spherical geometry sits in L = 4 pi r^2 F, so the divergence
+    is just a difference of L across a shell. This settles the 1/r^2 question from the
+    diagnosis: the working-tree operator (1/r^2) d/dr(r^2 kappa dv^2/dr) had the right
+    spherical divergence but no heat capacity per volume, (3/2) rho; the committed operator
+    d/dr(r^2 kappa dv^2/dr) without 1/r^2 was not a spherical divergence at all. Written per
+    shell, sum((3/2) dm v^2) is conserved exactly when L = 0 at both ends.
+    Backward Euler with kappa evaluated at the old v^2 (lagged), giving a tridiagonal system.
+    """
+    Cj = edge_conductance(r_edge, dm, v2_s)
+    cap = 1.5 * dm
+    diag = cap.copy()
+    diag[:-1] += dt * Cj
+    diag[1:] += dt * Cj
+    off = -dt * Cj
+    return thomas_solve(off, diag, off, cap * v2_s)
 
-central_density_history = []
-time_history = []
-snapshots = []
-snapshot_triggers = [2.0, 5.0, 10.0, 30.0, 100.0]
-next_trigger = 0
 
-rho = rho_stage3.copy()
-v2 = np.maximum(v2_stage3, 1e-8)
+def relax_to_hydrostatic(r_edge, dm, s, P_ext):
+    """STUB -- NOT IMPLEMENTED. Adiabatic return to hydrostatic equilibrium (BSI 2002, sec. 4:
+    "hydrostatic equilibrium is solved by keeping the entropy of each Lagrangian zone fixed,
+    while its position and other thermodynamic properties are modified").
 
-# We warm-start the implicit solve using the previous time level. This is standard in
-# time-dependent implicit methods because the solution changes smoothly from one step to
-# the next, and it greatly improves convergence without altering the underlying physics.
-t = 0.0
-step = 0
-dt = 1e-5
-max_steps = 3000
-max_frac_change = 3e-3
+    This is where the PdV heating -- the negative heat capacity of virial_theorem.py -- lives.
+    Plan for the formulation check:
+      held fixed : shell masses dm_i and shell entropies s_i = v_i^3 / rho_i
+      unknowns   : edge radii r_1..r_N (r_0 = 0 at the centre stays fixed)
+      per shell  : rho_i = dm_i / ((4 pi/3)(r_{i+1}^3 - r_i^3))
+                   v2_i  = (s_i rho_i)^(2/3)       <- v^2 ∝ rho^(2/3): compression heats
+                   p_i   = rho_i v2_i = s_i^(2/3) rho_i^(5/3)   (gamma = 5/3, monatomic)
+      equations  : hydrostatic_residual(...) = 0 at edges 1..N, outer edge against P_ext.
+      Edge j's equation involves p_{j-1} (depends on r_{j-1}, r_j), p_j (r_j, r_{j+1}) and r_j,
+      so linearising in the edge displacements gives the tridiagonal system
+          a_j dr_{j-1} + b_j dr_j + c_j dr_{j+1} = d_j     (d_j = -residual_j),
+      solved with thomas_solve and iterated (Newton) until the residual is small.
+      Returns new r_edge and v2; the caller recomputes s only after conduction steps.
+    """
+    raise NotImplementedError("Stage 3 relaxation step not built yet (awaiting formulation check).")
 
-while step < max_steps:
-    v2_new, rho_new, solve_status, residual_norm = coupled_implicit_step(
-        stage3_r, rho, v2, dt, M_total, x0=v2
-    )
 
-    if solve_status != "ok":
-        dt *= 0.5
-        if dt < 1e-12:
-            raise RuntimeError(
-                f"Coupled solve failed to converge even with reduced dt: residual={residual_norm:.3e}, message={solve_status}"
-            )
-        continue
+# ---------- setup checks (no time evolution is run) ----------
+rc = shell_centres(r_edge)
+M_trap = 4.0 * np.pi * np.trapezoid(r**2 * rho, r)
+res = hydrostatic_residual(r_edge, dm, P_s, P_ext)
+print("STAGE 3 SCAFFOLD - setup checks only; no evolution run")
+print(f"  shells: {n_shell}   total shell mass = {M_edge[-1]:.6e}   (trapezoid mass on Stage 1 grid {M_trap:.6e})")
+print(f"  P_ext (envelope beyond r = {r_edge[-1]:.0f}) = {P_ext:.6e}")
+print(f"  v2 in last 3 shells = {v2_s[-3:]}   (superseded Stage 2 edge had v2 = {v2_s2[-1]:.1f})")
+print(f"  max |hydrostatic residual| = {np.max(np.abs(res)):.3e}   (zero by construction:"
+      f" confirms the initial state is the relaxation step's fixed point)")
+print(f"  centre v2 = {v2_s[0]:.6f}   max v2 = {v2_s.max():.6f} at r = {rc[np.argmax(v2_s)]:.3f}")
+print("  canonical shell v2 vs superseded Stage 2 v2 at the same radius:")
+for target in [0.01, 0.1, 1.0, 10.0, 50.0, 90.0]:
+    k = np.argmin(np.abs(rc - target))
+    v2_old = np.interp(rc[k], r, v2_s2)
+    print(f"    r = {rc[k]:9.4f}   shells {v2_s[k]:.6f}   superseded {v2_old:.6f}   ratio {v2_s[k] / v2_old:.6f}")
 
-    frac_change = abs(rho_new[0] - rho[0]) / (rho[0] + 1e-12)
-    if frac_change > max_frac_change:
-        dt *= 0.5
-        continue
+L0 = luminosity(r_edge, dm, v2_s)
+print(f"  initial L: {np.sum(L0[1:-1] < 0)} of {n_shell - 1} interior edges carry heat INWARD (L < 0);"
+      f" outermost inward edge at r = {r_edge[1:-1][L0[1:-1] < 0].max() if np.any(L0[1:-1] < 0) else float('nan'):.3f}")
 
-    mass_now = 4.0 * np.pi * np.trapezoid(stage3_r**2 * rho_new, stage3_r)
-    mass_error = abs(mass_now - M_total) / M_total
-    if not np.isfinite(mass_now) or mass_error > 1e-8:
-        raise RuntimeError(f"Mass drift in stage 3: {mass_now:.12e} vs {M_total:.12e}")
-
-    rho = rho_new
-    v2 = v2_new
-    t += dt
-    step += 1
-    central_density_history.append(rho[0])
-    time_history.append(t)
-
-    if next_trigger < len(snapshot_triggers) and rho[0] >= snapshot_triggers[next_trigger] * rho0_initial:
-        snapshots.append((rho[0] / rho0_initial, rho.copy()))
-        next_trigger += 1
-
-    if rho[0] > 100.0 * rho0_initial or not np.isfinite(rho[0]):
-        break
-
-    dt = min(1.0e-4, dt * 1.1)
-    if step % 25 == 0:
-        print(f"step={step:5d}  t={t:.6e}  rho_c={rho[0]:.6e}  mass={mass_now:.12e}  dt={dt:.3e}  residual={residual_norm:.3e}")
-
-    if next_trigger == len(snapshot_triggers):
-        break
-
-# ---------- plot ----------
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5))
-
-ax1.loglog(stage3_r, rho_stage3, "k--", linewidth=1.5, label=f"initial (rho0={rho0_initial:.3e})")
-for factor, rho_snap in snapshots:
-    ax1.loglog(stage3_r, rho_snap, linewidth=2, label=f"core x{factor:.0f}")
-ax1.set_xlabel("radius")
-ax1.set_ylabel("density")
-ax1.set_title("Density profile snapshots (non-working Stage 3 attempt)")
-ax1.legend()
-ax1.grid(True, which="both", linestyle="--", alpha=0.4)
-
-ax2.semilogy(time_history, central_density_history, color="crimson", linewidth=2)
-ax2.set_xlabel("time")
-ax2.set_ylabel("central density")
-ax2.set_title("Central density vs time (as computed)")
-ax2.grid(True, which="both", linestyle="--", alpha=0.4)
-
-fig.suptitle("Stage 3: non-working Newton/LM attempt, superseded (no result claimed)", fontsize=13)
-plt.tight_layout()
-plt.savefig("gravothermal_stage3.png", dpi=150)
-plt.close()
-
-summary = [
-    "STAGE 3 - coupled hydrostatic/conduction solve",
-    f"  steps taken: {step}",
-    f"  final central density: {rho[0]:.6e}  (started at {rho0_initial:.6e})",
-    f"  contraction factor: {rho[0] / rho0_initial:.3f}",
-    f"  snapshots captured: {len(snapshots)}",
-    f"  total mass: {M_total:.12e}",
-    "  Saved gravothermal_stage3.png",
-]
-Path("gravothermal_stage3_summary.txt").write_text("\n".join(summary), encoding="utf-8")
-print("STAGE 3 - run ended (non-working attempt, no result claimed)")
-print(f"steps taken: {step}")
-print(f"final central density: {rho[0]:.6e} (started at {rho0_initial:.6e})")
-print(f"contraction factor: {rho[0] / rho0_initial:.3f}")
-print(f"snapshots captured: {len(snapshots)}")
-print(f"mass conserved: {M_total:.12e}")
-
-# ---------- plot ----------
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5))
-
-ax1.loglog(r, 1.0 / (1.0 + r**alpha), "k--", linewidth=1.5, label="initial")
-for factor, rho_snap in snapshots:
-    ax1.loglog(r, rho_snap, linewidth=2, label=f"core x{factor:.0f}")
-ax1.set_xlabel("radius")
-ax1.set_ylabel("density")
-ax1.set_title("Density profile snapshots (non-working Stage 3 attempt)")
-ax1.legend()
-ax1.grid(True, which="both", linestyle="--", alpha=0.4)
-
-ax2.semilogy(time_history, central_density_history, color="crimson", linewidth=2)
-ax2.set_xlabel("time")
-ax2.set_ylabel("central density")
-ax2.set_title("Central density vs time (as computed)")
-ax2.grid(True, which="both", linestyle="--", alpha=0.4)
-
-fig.suptitle("Stage 3: non-working Newton/LM attempt, superseded (no result claimed)", fontsize=13)
-plt.tight_layout()
-plt.savefig("gravothermal_stage3.png", dpi=150)
-plt.close()
-
-summary = [
-    "STAGE 3 - run ended (non-working attempt, no result claimed)",
-    f"  steps taken: {step}",
-    f"  final central density: {rho[0]:.2f}  (started at {rho0_initial:.2f})",
-    f"  contraction factor: {rho[0] / rho0_initial:.1f}",
-    f"  snapshots captured: {len(snapshots)}",
-    f"  total mass: {M_total:.12e}",
-    "  Saved gravothermal_stage3.png",
-]
-Path("gravothermal_stage3_summary.txt").write_text("\n".join(summary), encoding="utf-8")
-print("STAGE 3 - run ended (non-working attempt, no result claimed)")
-print(f"steps taken: {step}")
-print(f"final central density: {rho[0]:.6e} (started at {rho0_initial:.6e})")
-print(f"contraction factor: {rho[0] / rho0_initial:.3f}")
-print(f"snapshots captured: {len(snapshots)}")
-print(f"mass conserved: {M_total:.12e}")
+# Operator check of the conduction sub-step (one step at fixed rho; not an evolution).
+# dt is arbitrary here: conservation must hold for any dt (a scan of dt is in
+# diagnose_stage2_resolution.py, part 2).
+E_th0 = np.sum(1.5 * dm * v2_s)
+v2_one = conduction_step(r_edge, dm, v2_s, dt=1.0)
+E_th1 = np.sum(1.5 * dm * v2_one)
+print(f"  one conduction step (dt = 1): thermal energy change {abs(E_th1 - E_th0) / E_th0:.3e} (relative),"
+      f" max |dv2| = {np.abs(v2_one - v2_s).max():.4e}")
+print("  relaxation step: STUB (relax_to_hydrostatic raises NotImplementedError)")
