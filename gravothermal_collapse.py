@@ -310,7 +310,7 @@ def relaxation_system(r_edge, dm, s, P_ext):
             "lower": lower, "diag": diag, "upper": upper}
 
 
-def relax_to_hydrostatic(r_edge, dm, s, P_ext, tol=1e-10, step_tol=1e-13, max_iter=50, dense_check=True):
+def relax_to_hydrostatic(r_edge, dm, s, P_ext, tol=1e-10, max_iter=50, dense_check=True):
     """Adiabatic return to hydrostatic equilibrium (BSI 2002, sec. 4: "hydrostatic equilibrium is
     solved by keeping the entropy of each Lagrangian zone fixed, while its position and other
     thermodynamic properties are modified"). Formulation approved by the advisor before coding.
@@ -326,16 +326,25 @@ def relax_to_hydrostatic(r_edge, dm, s, P_ext, tol=1e-10, step_tol=1e-13, max_it
                  -G M rho / r^2, with M fixed per edge), linearised into the tridiagonal system
                  a_j dr_{j-1} + b_j dr_j + c_j dr_{j+1} = -F_j  (see relaxation_system), rows
                  scaled by g_j.
-    Iteration  : Newton loop of Thomas solves. Converged when max|F_j/g_j| <= max(tol, floor) AND
-                 the next Newton step has max|dr/r| <= step_tol (advisor ruling, option 1). "floor"
-                 is the double-precision floor of |F/g| computed from the current state (W_i
-                 cancellation, p ∝ W^(-5/3)): test 2 showed 1e-10 alone is below it (~1.35e-9), so
-                 the criterion never asks for digits the machine does not have, and adds no tuned
-                 constant. step_tol = 1e-13 lies between round-off steps (~1.5e-16) and physical
-                 displacements (~1e-4). If a step would make any edge non-monotonic, or would not
-                 reduce ||F/g||, it is halved; this changes the path, not the solution. Failure to
-                 converge in max_iter raises RuntimeError with the iteration history: the state is
-                 never accepted unconverged. Every solve returns its residual, floor and history.
+    Iteration  : Newton loop of Thomas solves, judged ROW BY ROW (advisor rulings). Each edge j
+                 has its own threshold t_j = max(tol, f_j), where f_j is the double-precision floor
+                 of |F_j/g_j| computed from the current state (W_i cancellation, p ∝ W^(-5/3)).
+                 Converged when |F_j/g_j| <= t_j for EVERY j AND every component of the next Newton
+                 step is within |J^-1| t (|J^-1|: elementwise absolute value of the dense inverse of
+                 the scaled Jacobian). If every row passes, |dr| = |J^-1 F/g| <= |J^-1| t by the
+                 triangle inequality, so the step test then only guards the Thomas solve's own
+                 round-off; the bound's size is reported as a conditioning warning.
+                 History of this criterion, all from measured failures: 1e-10 alone is below the
+                 floor (~1.35e-9, test 2); a fixed step bound of 1e-13 was not safe (the claim that
+                 it sat "600x" above round-off rested on one case and was wrong); and comparing
+                 max|F/g| against the LARGEST floor let a row near r ~ 2 sit 14x above its own floor
+                 unnoticed (scan, R = 10), because floors differ between rows by ~4 decades.
+                 Step halving: a step is halved if it would make any edge non-monotonic or would
+                 not reduce the weighted residual ||(F/g)/t||, so round-off noise in one row cannot
+                 hide a real error in another; this changes the path, not the solution. Failure
+                 (no acceptable step, or max_iter reached) raises RuntimeError with the iteration
+                 history: the state is never accepted unconverged. Every solve returns its residual,
+                 floor, worst row-to-threshold ratio, final step, step bound and history.
     Conditioning: the +4g/r gravity term reduces |b_j|, so diagonal dominance (which Thomas
                  without pivoting relies on) is not guaranteed. With dense_check, every Thomas
                  solve is compared with numpy.linalg.solve and the worst relative difference is
@@ -350,14 +359,14 @@ def relax_to_hydrostatic(r_edge, dm, s, P_ext, tol=1e-10, step_tol=1e-13, max_it
     Returns (r_edge_new, rho, v2, info).
     """
     def roundoff_floor(r_e, sm):
-        # Estimated floor of |F_j/g_j| from double precision: W_i = r_{i+1}^3 - r_i^3 loses
-        # (r_{i+1}^3 + r_i^3)/W_i of relative precision, and p ∝ W^(-5/3). Reporting only.
+        # Per-edge floor of |F_j/g_j| from double precision: W_i = r_{i+1}^3 - r_i^3 loses
+        # (r_{i+1}^3 + r_i^3)/W_i of relative precision, and p ∝ W^(-5/3).
         Wv = r_e[1:]**3 - r_e[:-1]**3
         dp = (5.0 / 3.0) * np.finfo(float).eps * (r_e[1:]**3 + r_e[:-1]**3) / Wv * sm["p"]
         fl = np.empty(len(dp))
         fl[:-1] = dp[:-1] + dp[1:]
         fl[-1] = dp[-1]
-        return np.max(fl / sm["g"])
+        return fl / sm["g"]
 
     r_cur = r_edge.copy()
     info = {"iterations": 0, "halvings": 0, "thomas_vs_dense": float("nan"),
@@ -372,12 +381,25 @@ def relax_to_hydrostatic(r_edge, dm, s, P_ext, tol=1e-10, step_tol=1e-13, max_it
         dx = thomas_solve(lo, di, up, rhs)
         worst = int(np.argmax(np.abs(sysm["F"] / g)))
         step = np.max(np.abs(dx) / r_cur[1:])
-        floor = roundoff_floor(r_cur, sysm)
-        info["history"].append((it, err, r_cur[worst + 1], step, floor))
-        if err <= max(tol, floor) and step <= step_tol:
-            converged = True
-            info["residual"], info["roundoff_floor"] = err, floor
-            break
+        fl_vec = roundoff_floor(r_cur, sysm)
+        floor = np.max(fl_vec)
+        t = np.maximum(tol, fl_vec)                          # per-row threshold t_j = max(tol, f_j)
+        row_ratio = np.abs(sysm["F"] / g) / t
+        worst_row = int(np.argmax(row_ratio))
+        info.setdefault("row_history", []).append((row_ratio[worst_row], r_cur[worst_row + 1]))
+        bound_rel = float("nan")
+        if np.all(row_ratio <= 1.0):
+            # every row at its threshold: the step can then be at most |J^-1| t
+            A = np.diag(di) + np.diag(lo, -1) + np.diag(up, 1)
+            bound = np.abs(np.linalg.inv(A)) @ t
+            bound_rel = np.max(bound / r_cur[1:])
+            if np.all(np.abs(dx) <= bound):
+                info["history"].append((it, err, r_cur[worst + 1], step, floor, bound_rel))
+                converged = True
+                info.update(residual=err, roundoff_floor=floor, step=step, step_bound=bound_rel,
+                            max_row_ratio=row_ratio[worst_row])
+                break
+        info["history"].append((it, err, r_cur[worst + 1], step, floor, bound_rel))
         dom = np.abs(di) / (np.concatenate(([0.0], np.abs(lo))) + np.concatenate((np.abs(up), [0.0])))
         info["min_diag_dominance"] = np.nanmin([info["min_diag_dominance"], dom.min()])
         if dense_check:
@@ -385,14 +407,14 @@ def relax_to_hydrostatic(r_edge, dm, s, P_ext, tol=1e-10, step_tol=1e-13, max_it
             dx_dense = np.linalg.solve(A, rhs)
             diff = np.max(np.abs(dx - dx_dense)) / np.max(np.abs(dx_dense))
             info["thomas_vs_dense"] = np.nanmax([info["thomas_vs_dense"], diff])
-        norm0 = np.linalg.norm(sysm["F"] / g)
+        norm0 = np.linalg.norm(sysm["F"] / g / t)            # weighted: each row against its threshold
         lam = 1.0
         while True:
             r_try = r_cur.copy()
             r_try[1:] += lam * dx
             if np.all(np.diff(r_try) > 0.0):
                 sys_try = relaxation_system(r_try, dm, s, P_ext)
-                if np.linalg.norm(sys_try["F"] / sys_try["g"]) < norm0:
+                if np.linalg.norm(sys_try["F"] / sys_try["g"] / t) < norm0:
                     break
             lam *= 0.5
             info["halvings"] += 1
@@ -410,9 +432,12 @@ def relax_to_hydrostatic(r_edge, dm, s, P_ext, tol=1e-10, step_tol=1e-13, max_it
 
 def history_text(info):
     """Per-iteration record of a relaxation solve, for error reports."""
-    lines = ["  iter   max|F/g|   at edge r    max|dr/r|   est. round-off floor of |F/g|"]
-    for it, e, rw, dxr, fl in info["history"]:
-        lines.append(f"  {it:4d}  {e:10.3e}  {rw:10.4e}  {dxr:10.3e}  {fl:10.3e}")
+    lines = ["  iter   max|F/g|   at edge r    max|dr/r|   floor |F/g|   max_j |F_j/g_j|/t_j  at edge r"
+             "    step bound max(|J^-1| t / r)"]
+    for (it, e, rw, dxr, fl, bd), (rr, rr_r) in zip(info["history"], info.get("row_history", [])):
+        bd_txt = "  (a row above its threshold: not computed)" if np.isnan(bd) else f"  {bd:10.3e}"
+        lines.append(f"  {it:4d}  {e:10.3e}  {rw:10.4e}  {dxr:10.3e}  {fl:10.3e}"
+                     f"  {rr:14.3e}       {rr_r:10.4e}" + bd_txt)
     return "\n".join(lines)
 
 

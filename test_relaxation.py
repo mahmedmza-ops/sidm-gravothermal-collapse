@@ -53,6 +53,8 @@ def jacobian_fd_error(r_edge, s):
 def solver_line(info):
     return (f"Newton updates {info['iterations']}, halvings {info['halvings']}, "
             f"final max|F/g| {info['residual']:.3e} (round-off floor {info['roundoff_floor']:.3e}),\n"
+            f"          worst row |F_j/g_j| / t_j = {info['max_row_ratio']:.3f} (must be <= 1),"
+            f" final step max|dr/r| {info['step']:.3e} (step bound {info['step_bound']:.3e}),\n"
             f"          Thomas vs dense {info['thomas_vs_dense']:.3e}, "
             f"min diag dominance |b|/(|a|+|c|) {info['min_diag_dominance']:.4f}\n"
             + gc.history_text(info))
