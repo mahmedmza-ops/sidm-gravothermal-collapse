@@ -14,6 +14,9 @@ STAGE 3: BSI (2002) "conduction-then-relaxation" in Lagrangian mass shells.
          [Shells, boundary conditions, conduction step and relaxation step are built.
          The relaxation step is UNDER TEST (test_relaxation.py; test 3 is the gate for
          any evolution). No evolution is run.]
+STAGE 4: time evolution loop, evolve() (conduction, entropy update, relaxation with a predictor
+         guess, adaptive dt, reject-and-retry). Pre-registered criterion in run_evolution.py.
+         [SHORT TEST STAGE: no long run yet.]
          The previous non-working Stage 3 (Newton/LM) is kept in git commit f0e90af;
          its three defects are shown in diagnose_stage3.py.
 Long-mean-free-path conduction only; a simplified reproduction of the self-similar regime.
@@ -49,16 +52,17 @@ def shell_centres(r_edge):
     return (0.5 * (r_edge[:-1]**3 + r_edge[1:]**3))**(1.0 / 3.0)
 
 
-def envelope_pressure(r_out, M_out, r_far=1e10, n=20001):
+def envelope_pressure(r_out, M_out, r_far=1e10, n=20001, rho_func=None):
     """Pressure the halo beyond r_out exerts at r_out: integral of G M rho / r^2 to infinity.
 
     The Stage 1 profile continues as rho ∝ r^-2.19 beyond the grid (BSI: the extended halo
     keeps this power law and barely evolves). r_out is a computational edge, not the edge of
     the halo, so the pressure there is the weight of the envelope outside it -- not zero.
     Integrand falls as r^-3.38, so stopping at r_far = 1e10 is negligible.
+    rho_func selects the profile (default: the Stage 1 cored profile).
     """
     rr = np.geomspace(r_out, r_far, n)
-    rho_t = rho_stage1(rr)
+    rho_t = (rho_stage1 if rho_func is None else rho_func)(rr)
     f = 4.0 * np.pi * rr**2 * rho_t
     M_t = M_out + np.concatenate(([0.0], np.cumsum(0.5 * (f[1:] + f[:-1]) * np.diff(rr))))
     return np.trapezoid(G * M_t * rho_t / rr**2, rr)
@@ -141,6 +145,41 @@ rho_s = shell_density(r_edge, dm)
 P_s = pressure_from_hse(r_edge, dm, P_ext)
 v2_s = P_s / rho_s
 s_s = v2_s**1.5 / rho_s
+
+# ---------- alternative initial halo: NFW (Navarro, Frenk & White 1996) -- UNDER CHECK ----------
+# The cored profile above is kept unchanged (all committed results use it). The NFW halo is the
+# standard cuspy starting point of the SIDM gravothermal literature:
+#   rho(r) = rho_s / [(r/r_s)(1 + r/r_s)^2],   M(r) = 4 pi rho_s r_s^3 [ln(1 + r/r_s) - (r/r_s)/(1 + r/r_s)]
+# with rho_s = r_s = G = 1. Shell masses come from the closed-form M(r), so they are exact. The
+# pressure is the same discrete hydrostatic integration as the canonical cored setup, inward from
+# the weight of the NFW envelope beyond the grid (no v^2 = 0 cliff), so the state is a fixed point
+# of the relaxation solver by construction.
+def rho_nfw(x):
+    """NFW density, rho_s = r_s = 1."""
+    return 1.0 / (x * (1.0 + x)**2)
+
+
+def mass_nfw(x):
+    """NFW enclosed mass, closed form, rho_s = r_s = 1 (log1p for accuracy at small x)."""
+    return 4.0 * np.pi * (np.log1p(x) - x / (1.0 + x))
+
+
+def build_nfw_halo(n_shell=200, r_min=1e-2, r_max=30.0):
+    """Lagrangian shells for an NFW halo in discrete hydrostatic equilibrium.
+
+    Edges: 0, then n_shell log-spaced radii from r_min to r_max (shell 0 is the sphere inside r_min).
+    Returns r_edge, dm, P_ext, rho (shell means), v2, s, P.
+    """
+    r_e = np.concatenate(([0.0], np.logspace(np.log10(r_min), np.log10(r_max), n_shell)))
+    M_e = mass_nfw(r_e)
+    dm_n = np.diff(M_e)
+    P_out = envelope_pressure(r_e[-1], M_e[-1], rho_func=rho_nfw)
+    rho_n = shell_density(r_e, dm_n)
+    P_n = pressure_from_hse(r_e, dm_n, P_out)
+    v2_n = P_n / rho_n
+    return {"r_edge": r_e, "dm": dm_n, "P_ext": P_out, "rho": rho_n, "v2": v2_n,
+            "s": v2_n**1.5 / rho_n, "P": P_n}
+
 
 # ---------- Stage 2 (original, SUPERSEDED): kept verbatim as a record, not used ----------
 # This was the first Stage 2 and carried a "verified" label on its mean residual of ~0.05.
@@ -428,6 +467,89 @@ def relax_to_hydrostatic(r_edge, dm, s, P_ext, tol=1e-10, max_iter=50, dense_che
         raise RuntimeError(f"relaxation did not converge in {max_iter} iterations: "
                            f"max relative residual {err:.3e}\n" + history_text(info))
     return r_cur, sysm["rho"], sysm["v2"], info
+
+
+def region_virial(r_e, dm, v2_s, J, P_ext):
+    """2K, W and 3 p_s V for the region made of shells 0..J-1 (surface at edge J).
+
+    Summing the discrete hydrostatic equations times 4 pi r_j^3 over edges 1..J gives exactly
+    2K + W = 3 p_s V; |W| / 3 p_s V > 1 means the region is held up by its own gravity.
+    (Same quantities as scan_heat_capacity.py.)
+    """
+    rho_e = shell_density(r_e, dm)
+    gtil = gravity_terms(r_e, dm) * 4.0 * np.pi * r_e[1:]**4      # G M_j dmbar_j, edges 1..N
+    W = -np.sum(gtil[:J] / r_e[1:J + 1])
+    twoK = 3.0 * np.sum(dm[:J] * v2_s[:J])
+    p_s = P_ext if J == len(dm) else rho_e[J] * v2_s[J]
+    return twoK, W, 3.0 * p_s * (4.0 / 3.0) * np.pi * r_e[J]**3
+
+
+def evolve(r_start, v2_start, dm, P_ext, dt0, n_steps, xi=0.02, growth_cap=1.2, dt_min=1e-16):
+    """Gravothermal time evolution (Stage 4): yields one record per accepted step.
+
+    Each step, as pre-registered by the advisor:
+      1. conduction_step (implicit, density fixed), then each shell's entropy s = v^3/rho is
+         updated from the new v^2 -- the only place s changes;
+      2. relax_to_hydrostatic (unchanged, per-row criterion), started from a PREDICTOR guess:
+         r_guess = r(t) + (r(t) - r(t - dt_old)) / dt_old * dt_new. The guess only changes where
+         Newton starts, not the solution; if it would make an edge non-monotonic, r(t) is used;
+      3. on success, the next dt = dt * min(growth_cap, xi / max_i |drho_i / rho_i|)
+         (xi = 0.02: no shell's density should change by more than ~2% per step);
+      4. reject-and-retry: if relaxation raises, conduction gives a non-finite or non-positive
+         v^2, or the shells' total mass differs from sum(dm) by more than 1e-12 (relative), the
+         state is left unchanged and dt is halved. Below dt_min the evolution stops with
+         RuntimeError ("breakdown"). Shell masses are fixed by construction in this Lagrangian
+         scheme, so the mass check is expected to pass always; it is kept as asked.
+    dt0 is a numerical starting value only; the controller then sets dt.
+    """
+    V = lambda r_e: 4.0 / 3.0 * np.pi * (r_e[1:]**3 - r_e[:-1]**3)
+    r = r_start.copy()
+    v2 = v2_start.copy()
+    rho = shell_density(r, dm)
+    r_prev, dt_prev = None, None
+    t, dt = 0.0, dt0
+    M_tot = np.sum(dm)
+    for step in range(1, n_steps + 1):
+        rejections, reasons = 0, []
+        while True:
+            if dt < dt_min:
+                raise RuntimeError(f"breakdown at step {step}, t = {t:.6e}: dt fell below {dt_min:g} "
+                                   f"after {rejections} rejections; last reasons: {reasons[-3:]}")
+            v2_c = conduction_step(r, dm, v2, dt)
+            if not np.all(np.isfinite(v2_c)) or np.any(v2_c <= 0.0):
+                rejections += 1
+                reasons.append("conduction gave non-finite or non-positive v2")
+                dt *= 0.5
+                continue
+            s_new = v2_c**1.5 / rho
+            guess, predicted = r, False
+            if r_prev is not None:
+                g_try = r + (r - r_prev) / dt_prev * dt
+                if np.all(np.diff(g_try) > 0.0):
+                    guess, predicted = g_try, True
+            try:
+                r_new, rho_new, v2_new, info = relax_to_hydrostatic(guess, dm, s_new, P_ext)
+            except RuntimeError as e:
+                rejections += 1
+                reasons.append("relaxation: " + str(e).splitlines()[0])
+                dt *= 0.5
+                continue
+            mass_err = abs(np.sum(rho_new * V(r_new)) - M_tot) / M_tot
+            if mass_err > 1e-12:
+                rejections += 1
+                reasons.append(f"mass error {mass_err:.2e}")
+                dt *= 0.5
+                continue
+            break
+        max_drho = np.max(np.abs(rho_new / rho - 1.0))
+        dt_used = dt
+        r_prev, dt_prev = r, dt
+        r, v2, rho = r_new, v2_new, rho_new
+        t += dt_used
+        dt = dt_used * (growth_cap if max_drho == 0.0 else min(growth_cap, xi / max_drho))
+        yield {"step": step, "t": t, "dt_used": dt_used, "dt_next": dt, "r": r, "v2": v2, "rho": rho,
+               "max_drho": max_drho, "rejections": rejections, "reasons": reasons,
+               "predicted": predicted, "info": info, "mass_err": mass_err}
 
 
 def history_text(info):
