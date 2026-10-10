@@ -1,6 +1,7 @@
 # Never publish source papers or personal documents
 *.md
 !CAPSTONE_FINDINGS.md
+!README.md
 *.pdf
 *.docx
 Must Study Links.txt
