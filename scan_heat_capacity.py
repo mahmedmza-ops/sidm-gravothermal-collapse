@@ -1,5 +1,5 @@
 """
-EXPLORATORY DIAGNOSTIC -- cannot overturn the t=0 gate, which stands as FAIL (commit 9e7a80e).
+EXPLORATORY DIAGNOSTIC -- cannot overturn the t=0 gate, which stands as FAIL (commit 24c571b).
 Question: does negative heat capacity exist anywhere in this halo at t=0, and at what scale?
 Changes nothing; imports gravothermal_collapse.py (setup checks print first; no evolution).
 

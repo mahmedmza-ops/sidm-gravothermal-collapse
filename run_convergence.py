@@ -1,5 +1,5 @@
 """
-Convergence test of the Stage 4 collapse (baseline: run_collapse.py, record committed in 2147792).
+Convergence test of the Stage 4 collapse (baseline: run_collapse.py, record committed in 7175181).
 Question: did the scheme's energy leak (an artificial heat sink, drift -1.43e-3) drive the collapse?
 
   python run_convergence.py A        -> variant A: xi = 0.01, 200 shells   (writes stage4_conv_A.csv)

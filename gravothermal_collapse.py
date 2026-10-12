@@ -17,7 +17,7 @@ STAGE 3: BSI (2002) "conduction-then-relaxation" in Lagrangian mass shells.
 STAGE 4: time evolution loop, evolve() (conduction, entropy update, relaxation with a predictor
          guess, adaptive dt, reject-and-retry). Pre-registered criterion in run_evolution.py.
          [SHORT TEST STAGE: no long run yet.]
-         The previous non-working Stage 3 (Newton/LM) is kept in git commit f0e90af;
+         The previous non-working Stage 3 (Newton/LM) is kept in git commit 7b3646a;
          its three defects are shown in diagnose_stage3.py.
 Long-mean-free-path conduction only; a simplified reproduction of the self-similar regime.
 """

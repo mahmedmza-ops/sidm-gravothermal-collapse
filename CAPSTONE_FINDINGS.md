@@ -184,7 +184,7 @@ The evolution then used the standard cuspy halo of the SIDM literature (Navarro,
 - **Self-gravity.** |W|/3p_sV is 0.29 at R = 0.1 and 0.55 at R = 0.3, crossing 1 near r_s. The
   centre of the cusp is not self-gravitating.
 
-## The pre-registered run (`run_collapse.py`, committed in `1c2eb65` before it ran)
+## The pre-registered run (`run_collapse.py`, committed in `9c2b84c` before it ran)
 
 **Criterion.** Fixed and committed before the run. Gravothermal collapse is demonstrated if and
 only if all four hold:
@@ -210,7 +210,7 @@ gravothermal collapse demonstrated.** The verdict was held as provisional until 
 test below. This is negative heat capacity, the mechanism of `virial_theorem.py`, running away
 inside a halo.
 
-## The convergence test (`run_convergence.py`, committed in `3aecd1f` before it ran)
+## The convergence test (`run_convergence.py`, committed in `9ffd969` before it ran)
 
 **The concern.** The scheme loses a little energy (−1.43×10⁻³ of the total over the run). Lost
 energy acts as an artificial heat sink, and a heat sink speeds up gravothermal collapse. The test
