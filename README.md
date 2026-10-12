@@ -1,7 +1,7 @@
 # Gravothermal core collapse in a self-interacting dark matter halo
 An independent numerical reproduction of the gravothermal collapse mechanism.
 
-**Mudrik Zubeir Ahmed** · [linkedin.com/in/mdrk](https://linkedin.com/in/mdrk)
+**Mudrik Zubeir Ahmed** · [linkedin.com/in/mdrk](https://linkedin.com/in/mdrk) · ORCID [0009-0002-0530-4970](https://orcid.org/0009-0002-0530-4970)
 
 This repository contains a Lagrangian gravothermal fluid solver and three supporting simulations, built to reproduce the core-collapse mechanism argued for in my 2020 BSc dissertation, *Galactic Black Holes* (Northumbria University, unpublished), following Balberg, Shapiro & Inagaki (2002).
 
