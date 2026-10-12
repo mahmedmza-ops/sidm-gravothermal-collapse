@@ -1,10 +1,11 @@
-# Dissertation to Simulation
+# Gravothermal core collapse in a self-interacting dark matter halo
+An independent numerical reproduction of the gravothermal collapse mechanism.
 
 **Mudrik Zubeir Ahmed** · [linkedin.com/in/mdrk](https://linkedin.com/in/mdrk)
 
-Taking the mathematics of my undergraduate physics dissertation and carrying it through to working, verified simulation code.
+This repository contains a Lagrangian gravothermal fluid solver and three supporting simulations, built to reproduce the core-collapse mechanism argued for in my 2020 BSc dissertation, *Galactic Black Holes* (Northumbria University, unpublished), following Balberg, Shapiro & Inagaki (2002).
 
-In 2020 I wrote a BSc dissertation, *Galactic Black Holes*, which argued that supermassive black holes form from the gravothermal collapse of self-interacting dark matter halos, following Balberg, Shapiro & Inagaki (2002). The dissertation was analytical: derivations on paper, no code. This repository takes those same derivations and makes them run.
+The dissertation was analytical: derivations on paper, no code. This repository takes those same derivations and makes them run.
 
 **What this is, stated plainly.** Every result here reproduces established physics. Nothing in this repository is a new discovery. What it offers is an independent implementation, real verification, and claims held to exactly what the numbers support.
 
