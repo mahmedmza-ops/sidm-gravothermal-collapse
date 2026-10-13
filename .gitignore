@@ -2,6 +2,10 @@
 *.md
 !CAPSTONE_FINDINGS.md
 !README.md
+
+# Derived output: rerun_dense.py regenerates these bit-for-bit (the committed record stands separately)
+stage4_dense_rerun.csv
+stage4_dense_rerun.npz
 *.pdf
 *.docx
 Must Study Links.txt

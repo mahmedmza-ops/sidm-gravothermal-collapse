@@ -11,9 +11,12 @@ Pacing: frames are spaced by STEP, not by time. The time step is adaptive (each 
 shell's density by at most ~2%), so equal steps carry comparable amounts of change: the slow
 middle phase (t ~ 18-150) takes few steps and the runaway gets its share of the frames.
 Units are dimensionless: G = rho_s = r_s = 1.
-Run:  python animate_collapse.py
+Run:  python animate_collapse.py         -> gravothermal_collapse.gif (full version, in the repository)
+      python animate_collapse.py light   -> gravothermal_collapse_light.gif (lighter, for sharing:
+                                            every 7th step, smaller frame, target ~2 MB or under)
 """
 
+import sys
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
@@ -24,7 +27,10 @@ rho_c0 = rho_all[0][0]
 rc = rho_all[:, 0] / rho_c0
 centres = (0.5 * (r_all[:, :-1]**3 + r_all[:, 1:]**3))**(1.0 / 3.0)
 
-EVERY, HOLD = 3, 25                     # every 3rd step; hold the final frame
+LIGHT = len(sys.argv) > 1 and sys.argv[1] == "light"
+EVERY, HOLD = (7, 15) if LIGHT else (3, 25)      # step spacing between frames; hold on the final frame
+DPI, FPS = (60, 15) if LIGHT else (80, 20)
+OUT = "gravothermal_collapse_light.gif" if LIGHT else "gravothermal_collapse.gif"
 frames = list(range(0, len(steps), EVERY))
 if frames[-1] != len(steps) - 1:
     frames.append(len(steps) - 1)
@@ -71,6 +77,6 @@ def update(k):
 
 
 ani = FuncAnimation(fig, update, frames=frames, interval=50, blit=False)
-ani.save("gravothermal_collapse.gif", writer=PillowWriter(fps=20), dpi=80)
-print(f"Saved gravothermal_collapse.gif: {len(frames)} frames ({len(frames) - HOLD} distinct, every {EVERY}rd step,"
+ani.save(OUT, writer=PillowWriter(fps=FPS), dpi=DPI)
+print(f"Saved {OUT}: {len(frames)} frames ({len(frames) - HOLD} distinct, every {EVERY} steps,"
       f" plus a {HOLD}-frame hold on the final step), from stage4_dense_rerun.npz ({len(steps)} profiles).")
